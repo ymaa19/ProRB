@@ -3,10 +3,11 @@ from utils.tokenizer import *
 from model.model import *
 from model.attn import *
 from esm.models.esmc import ESMC
+from esm.utils.sampling import _BatchedESMProteinTensor
 from esm.sdk.api import LogitsConfig, ESMProteinTensor
 from multimolecule import RnaFmModel, RnaFmConfig
 class Model(nn.Module):
-    def __init__(self, vocab_size, hidden_dim=64, alpha=0.4):
+    def __init__(self, hidden_dim=64, alpha=0.4):
         super(Model, self).__init__()
         # self.embedding = nn.Embedding(vocab_size, hidden_dim)
         self.rna_config = RnaFmConfig.from_pretrained("/data/ymxue/p4_protna/code/fm_model/rnafm")
@@ -32,30 +33,46 @@ class Model(nn.Module):
             nn.LayerNorm(256),
             nn.Linear(256, 64),
         )
+        self.rna_norm_gen = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, 64),
+        )
         self.alpha = alpha
         self.prorcom_attn = ProRComAttnModule(dim=hidden_dim, alpha=self.alpha)
         self.token_emb = nn.Embedding(26, hidden_dim)
+        self.pos_emb = nn.Parameter(torch.zeros(1, 512 + 1, hidden_dim)) # 预留位置编码
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=8, dim_feedforward=hidden_dim*4, batch_first=True
+        )
 
         for param in self.rna_model.parameters():
             param.requires_grad = False
         for param in self.prot_model.parameters():
             param.requires_grad = False
 
-    def forward(self, rna_id, prot_id, prot_pad=None, rna_pad=None, mode="generate"):
+    def forward(self, rna_id, prot_id, prot_pad=None, rna_pad=None, mode="train"):
         # print("forward")
-        # prot
-        prot_tensor = ESMProteinTensor()
-        prot_tensor.sequence = prot_id.to(self.prot_model.device)
-        prot_self_emb = self.prot_model.logits(prot_tensor, LogitsConfig(sequence=True, return_embeddings=True))
+        # prot_tensor = ESMProteinTensor()
+        # prot_tensor.sequence = prot_id.to(self.prot_model.device)
+        prot_id = prot_id.to(device=self.prot_model.device, dtype=torch.long)
+        batched_prot_tensor = _BatchedESMProteinTensor(sequence=prot_id)
+        prot_self_emb = self.prot_model.logits(batched_prot_tensor, LogitsConfig(sequence=True, return_embeddings=True))
         prot_self_emb = self.prot_norm(prot_self_emb.logits.sequence.to(torch.float))
         # rna
         if mode != "generate":
             rna_self_emb = self.rna_model(rna_id, rna_pad) if rna_id is not None else None
             rna_self_emb = self.rna_norm(rna_self_emb.last_hidden_state.to(torch.float)) if rna_self_emb is not None else None
         else:
-            rna_self_emb = self.token_emb(rna_id) 
+            seq_len = rna_id.size(1)
+            x = self.token_emb(rna_id) + self.pos_emb[:, :seq_len, :]
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=rna_id.device), diagonal=1).bool()
+            rna_self_emb = self.encoder_layer(x, src_mask=causal_mask, src_key_padding_mask=~(rna_pad.bool()))
+            rna_self_emb = self.rna_norm_gen(rna_self_emb.to(torch.float))
         # print('rna_self_emb shape:', rna_self_emb.shape)
-        complex_emb, rna_embed, protein_embed, aux_loss, fake_rna = self.prorcom_attn(rna_self_emb, prot_self_emb, prot_pad, rna_pad)
+        complex_emb, rna_embed, protein_embed, aux_loss, fake_rna_combo = self.prorcom_attn(rna_self_emb, prot_self_emb, prot_pad, rna_pad)
+        fake_rna = fake_rna_combo[-1]
         return complex_emb, rna_embed, protein_embed, aux_loss, fake_rna
 
 class proj_token(nn.Module):
@@ -70,10 +87,10 @@ class proj_token(nn.Module):
 
         self.alpha = alpha
 
-        self.model = Model(vocab_size=64, hidden_dim=64, alpha=self.alpha)
+        self.model = Model(hidden_dim=64, alpha=self.alpha)
 
     def forward(self, rna_id, prot_id, prot_pad, rna_pad):
-        _, rna_emb, protein_emb, aux_loss, fake_rna = self.model(rna_id, prot_id, prot_pad=prot_pad, rna_pad=rna_pad)
+        _, rna_emb, protein_emb, aux_loss, fake_rna = self.model(rna_id, prot_id, prot_pad=prot_pad, rna_pad=rna_pad, mode='train')
         rna_emb = self.rna_proj(rna_emb)
         protein_emb = self.prot_proj(protein_emb)
 
@@ -104,8 +121,8 @@ def train(model, dataloader, optimizer, criterion, device, log_file):
 
         loss_extra = criterion(rna_decode.view(-1, 26), rna_labels.view(-1))
 
-        loss = loss_prot + loss_rna + aux_loss + loss_extra
-        # loss = loss_prot + loss_rna
+        # loss = loss_prot + loss_rna + aux_loss + loss_extra
+        loss = loss_prot + loss_rna + aux_loss
 
         # 打印损失
         if batch_idx % 500 == 0:
@@ -163,7 +180,7 @@ if __name__ == '__main__':
 
     # 构建 DataLoader
     # 初始化模型、优化器和损失函数
-    # model = Model(vocab_size=args.vocab_size, alpha=args.alpha).to(args.device)
+    # model = Model(alpha=args.alpha).to(args.device)
     model = proj_token(hidden_dim=64, alpha=args.alpha).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=-100)  # 忽略填充位置
