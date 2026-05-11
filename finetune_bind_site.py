@@ -6,6 +6,10 @@ from utils.tokenizer import *
 from model.model import *
 from model.attn import *
 
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 # 下游任务头
 class DownstreamHead(nn.Module):
     def __init__(self, input_dim):
@@ -24,7 +28,8 @@ class ModelFineTune(nn.Module):
         # 定义模型
         self.model = Model(hidden_dim, alpha=alpha)
         # 定义下游任务头
-        self.head = DownstreamHead(hidden_dim)
+        self.rna_head = DownstreamHead(hidden_dim)
+        self.prot_head = DownstreamHead(hidden_dim)
 
         # 加载预训练权重
         if pretrained_weights_path is not None:
@@ -37,28 +42,33 @@ class ModelFineTune(nn.Module):
         """
         try:
             pretrained_weights = torch.load(path, map_location='cpu')
-            if "model" in pretrained_weights:
-                pretrained_weights = pretrained_weights["model"]
-            pretrained_weights = {k.replace("model.", ""): v for k, v in pretrained_weights.items()}
-            self.model.load_state_dict(pretrained_weights, strict=False)
+            processed_weights = {}
+            for k, v in pretrained_weights.items():
+                if k.startswith("model."):
+                    new_key = k[6:] # 跳过开头的 "model."
+                else:
+                    new_key = k
+                processed_weights[new_key] = v
+            self.model.load_state_dict(processed_weights, strict=False)
             print("Successfully loaded pretrained weights.")
         except Exception as e:
             print(f"Failed to load pretrained weights: {e}")
 
     def forward(self, protein_input, rna_input=None, prot_pad=None, rna_pad=None):
         # print("forward")
-        complex_embed, rna_embed, protein_embed, aux_loss, fake_rna = self.model(rna_input, protein_input, prot_pad, rna_pad, mode='generate')
+        complex_embed, rna_embed, protein_embed, aux_loss, fake_rna = self.model(rna_input, protein_input, prot_pad, rna_pad, mode='train')
         # print("forward1")
-        res_rna = self.head(rna_embed)
-        res_protein = self.head(protein_embed)
-        return res_rna, res_protein, fake_rna
+        res_rna = self.rna_head(rna_embed)
+        res_protein = self.prot_head(protein_embed)
+        return res_rna, res_protein, (rna_embed, protein_embed, fake_rna)
 
 # 训练函数
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, roc_auc_score, matthews_corrcoef, average_precision_score, f1_score
+import random
 
-def train(model, dataloader, optimizer, device):
+def train(model, dataloader, optimizer, device, local_rank):
     model.train()
     total_loss = 0
     res_lis_rna = []
@@ -75,14 +85,21 @@ def train(model, dataloader, optimizer, device):
         rna_padding_mask = batch["rna_padding_mask"].to(device)
 
         optimizer.zero_grad()
-        res_rna, res_prot, aux_loss = model(rna_input=rna_input_ids, protein_input=prot_input_ids, prot_pad=prot_padding_mask, rna_pad=rna_padding_mask)
-        res_rna_valid = res_rna[rna_bind != 6]
-        res_prot_valid = res_prot[prot_bind != 6]
-        label_rna_valid = rna_bind[rna_bind != 6]
-        label_prot_valid = prot_bind[prot_bind != 6]
+        res_rna, res_prot, _ = model(rna_input=rna_input_ids, protein_input=prot_input_ids, prot_pad=prot_padding_mask, rna_pad=rna_padding_mask)
+        mask_rna = (rna_bind != 6) & (rna_bind != 2)
+        mask_prot = (prot_bind != 6) & (prot_bind != 2)
+
+        res_rna_valid = res_rna[mask_rna].contiguous() # 强制内存连续
+        label_rna_valid = rna_bind[mask_rna].float().contiguous()
         
-        bce_loss_rna = nn.BCEWithLogitsLoss(reduction='mean')(res_rna_valid, label_rna_valid.float())
-        bce_loss_prot = nn.BCEWithLogitsLoss(reduction='mean')(res_prot_valid, label_prot_valid.float())
+        res_prot_valid = res_prot[mask_prot].contiguous()
+        label_prot_valid = prot_bind[mask_prot].float().contiguous()
+
+        pos_weight = torch.tensor([15.0], device=device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+        bce_loss_rna = criterion(res_rna_valid, label_rna_valid.float())
+        bce_loss_prot = criterion(res_prot_valid, label_prot_valid.float())
 
         loss = bce_loss_prot + bce_loss_rna
         # loss = bce_loss_prot + bce_loss_rna + aux_loss
@@ -107,18 +124,45 @@ def train(model, dataloader, optimizer, device):
     pred_labels_rna = (res_lis_rna > threshold).int()  # 根据概率值生成预测标签
     pred_labels_prot = (res_lis_prot > threshold).int()  # 根据概率值生成预测标签
     acc_rna, acc_prot = accuracy_score(tgt_lis_rna, pred_labels_rna), accuracy_score(tgt_lis_prot, pred_labels_prot)  # 准确率
-    auc_rna, auc_prot = roc_auc_score(tgt_lis_rna, res_lis_rna), roc_auc_score(tgt_lis_prot, res_lis_prot)  # AUC
-    mcc_rna, mcc_prot = matthews_corrcoef(tgt_lis_rna, pred_labels_rna), matthews_corrcoef(tgt_lis_prot, pred_labels_prot)  # MCC
+    # auc_rna, auc_prot = roc_auc_score(tgt_lis_rna, res_lis_rna), roc_auc_score(tgt_lis_prot, res_lis_prot)  # AUC
+    def safe_roc_auc_score(y_true, y_score):
+        """
+        鲁棒的 AUC 计算函数
+        """
+        # 1. 检查 y_score 是否包含 NaN
+        if torch.isnan(y_score).any():
+            return 0.5  # 或者返回 np.nan，取决于你是否想在日志里看到它
+        
+        y_true_np = y_true.numpy()
+        y_score_np = y_score.numpy()
+        
+        # 2. 检查是否同时包含两个类别
+        if len(np.unique(y_true_np)) < 2:
+            return 0.5 # 只有一类数据时，AUC 理论无意义，返回 0.5 占位
+            
+        return roc_auc_score(y_true_np, y_score_np)
 
+    def safe_auprc_score(y_true, y_score):
+        if torch.isnan(y_score).any() or len(np.unique(y_true)) < 2:
+            return 0.0 # 或者根据需要返回合理占位符
+        return average_precision_score(y_true, y_score)
+
+    # 在 train 和 validate 中替换原有的调用：
+    auc_rna = safe_roc_auc_score(tgt_lis_rna, res_lis_rna)
+    auc_prot = safe_roc_auc_score(tgt_lis_prot, res_lis_prot)
+    mcc_rna, mcc_prot = matthews_corrcoef(tgt_lis_rna, pred_labels_rna), matthews_corrcoef(tgt_lis_prot, pred_labels_prot)  # MCC
+    auprc_rna, auprc_prot = safe_auprc_score(tgt_lis_rna, res_lis_rna), safe_auprc_score(tgt_lis_prot, res_lis_prot)  # AUPRC
+    
     # 打印整个 epoch 的结果
     avg_loss = total_loss / len(dataloader)
-    print(f"Epoch Summary: Avg Loss = {avg_loss:.4f}, "
-          f"ACC = {acc_rna:.4f}, AUC = {auc_rna:.4f}, MCC = {mcc_rna:.4f}, "
-          f"ACC = {acc_prot:.4f}, AUC = {auc_prot:.4f}, MCC = {mcc_prot:.4f}")
+    if local_rank <= 0 and (batch_idx + 1) % 100 == 0:
+        # 计算当前阶段的平均 Loss
+        current_avg_loss = total_loss / (batch_idx + 1)
+        print(f"Step [{batch_idx + 1}/{len(dataloader)}], Loss: {current_avg_loss:.4f}")
+    return avg_loss, (acc_rna, acc_prot), (auc_rna, auc_prot), (mcc_rna, mcc_prot), (auprc_rna, auprc_prot)
 
-    return avg_loss, (acc_rna, acc_prot), (auc_rna, auc_prot), (mcc_rna, mcc_prot)
 
-def validate(model, dataloader, device):
+def validate(model, dataloader, device, local_rank):
     """
     验证模型在验证集上的性能。
     :param model: 模型实例
@@ -144,16 +188,22 @@ def validate(model, dataloader, device):
             rna_padding_mask = batch["rna_padding_mask"].to(device)
 
             # 前向传播
-            res_rna, res_prot, aux_loss = model(rna_input=rna_input_ids, protein_input=prot_input_ids, prot_pad=prot_padding_mask, rna_pad=rna_padding_mask)
-            res_rna_valid = res_rna[rna_bind != 6]
-            res_prot_valid = res_prot[prot_bind != 6]
-            label_rna_valid = rna_bind[rna_bind != 6]
-            label_prot_valid = prot_bind[prot_bind != 6]
+            res_rna, res_prot, _ = model(rna_input=rna_input_ids, protein_input=prot_input_ids, prot_pad=prot_padding_mask, rna_pad=rna_padding_mask)
+            mask_rna = (rna_bind != 6) & (rna_bind != 2)
+            mask_prot = (prot_bind != 6) & (prot_bind != 2)
+
+            res_rna_valid = res_rna[mask_rna].contiguous() # 强制内存连续
+            label_rna_valid = rna_bind[mask_rna].float().contiguous()
+            
+            res_prot_valid = res_prot[mask_prot].contiguous()
+            label_prot_valid = prot_bind[mask_prot].float().contiguous()
 
             # 计算损失
-            bce_loss_rna = nn.BCEWithLogitsLoss(reduction='mean')(res_rna_valid, label_rna_valid.float())
-            bce_loss_prot = nn.BCEWithLogitsLoss(reduction='mean')(res_prot_valid, label_prot_valid.float())
-            loss = bce_loss_prot + bce_loss_rna
+            pos_weight = torch.tensor([15.0], device=device)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            loss_rna = criterion(res_rna_valid, label_rna_valid.float())
+            loss_prot = criterion(res_prot_valid, label_prot_valid.float())
+            loss = loss_rna + loss_prot
             # 累积总损失
             total_loss += loss.item()
 
@@ -172,16 +222,42 @@ def validate(model, dataloader, device):
         pred_labels_rna = (res_lis_rna > threshold).int()  # 根据概率值生成预测标签
         pred_labels_prot = (res_lis_prot > threshold).int()  # 根据概率值生成预测标签
         acc_rna, acc_prot = accuracy_score(tgt_lis_rna, pred_labels_rna), accuracy_score(tgt_lis_prot, pred_labels_prot)  # 准确率
-        auc_rna, auc_prot = roc_auc_score(tgt_lis_rna, res_lis_rna), roc_auc_score(tgt_lis_prot, res_lis_prot)  # AUC
+        # auc_rna, auc_prot = roc_auc_score(tgt_lis_rna, res_lis_rna), roc_auc_score(tgt_lis_prot, res_lis_prot)  # AUC
+        def safe_roc_auc_score(y_true, y_score):
+            """
+            鲁棒的 AUC 计算函数
+            """
+            # 1. 检查 y_score 是否包含 NaN
+            if torch.isnan(y_score).any():
+                return 0.5  # 或者返回 np.nan，取决于你是否想在日志里看到它
+            
+            y_true_np = y_true.numpy()
+            y_score_np = y_score.numpy()
+            
+            # 2. 检查是否同时包含两个类别
+            if len(np.unique(y_true_np)) < 2:
+                return 0.5 # 只有一类数据时，AUC 理论无意义，返回 0.5 占位
+                
+            return roc_auc_score(y_true_np, y_score_np)
+        
+        def safe_auprc_score(y_true, y_score):
+            if torch.isnan(y_score).any() or len(np.unique(y_true)) < 2:
+                return 0.0 # 或者根据需要返回合理占位符
+            return average_precision_score(y_true, y_score)
+
+        # 在 train 和 validate 中替换原有的调用：
+        auc_rna = safe_roc_auc_score(tgt_lis_rna, res_lis_rna)
+        auc_prot = safe_roc_auc_score(tgt_lis_prot, res_lis_prot)
         mcc_rna, mcc_prot = matthews_corrcoef(tgt_lis_rna, pred_labels_rna), matthews_corrcoef(tgt_lis_prot, pred_labels_prot)  # MCC
-        auprc_rna, auprc_prot = average_precision_score(tgt_lis_rna, res_lis_rna), average_precision_score(tgt_lis_prot, res_lis_prot)  # AUPRC
+        auprc_rna, auprc_prot = safe_auprc_score(tgt_lis_rna, res_lis_rna), safe_auprc_score(tgt_lis_prot, res_lis_prot)  # AUPRC
         f1_rna, f1_prot = f1_score(tgt_lis_rna, pred_labels_rna), f1_score(tgt_lis_prot, pred_labels_prot)  # F1
 
     # 打印验证集的结果
     avg_loss = total_loss / len(dataloader)
-    print(f"Validation Summary: Avg Loss = {avg_loss:.4f}, "
-          f"rna---ACC = {acc_rna:.4f}, AUC = {auc_rna:.4f}, MCC = {mcc_rna:.4f}, AUPRC = {auprc_rna:.4f}, F1 = {f1_rna:.4f}, "
-          f"prot---ACC = {acc_prot:.4f}, AUC = {auc_prot:.4f}, MCC = {mcc_prot:.4f}, AUPRC = {auprc_prot:.4f}, F1 = {f1_prot:.4f}")
+    if local_rank <= 0:
+        print(f"Validation Summary: Avg Loss = {avg_loss:.4f}, "
+            f"rna---ACC = {acc_rna:.4f}, AUC = {auc_rna:.4f}, MCC = {mcc_rna:.4f}, AUPRC = {auprc_rna:.4f}, F1 = {f1_rna:.4f}, "
+            f"prot---ACC = {acc_prot:.4f}, AUC = {auc_prot:.4f}, MCC = {mcc_prot:.4f}, AUPRC = {auprc_prot:.4f}, F1 = {f1_prot:.4f}")
 
     return avg_loss, (acc_rna, acc_prot), (auc_rna, auc_prot), (mcc_rna, mcc_prot), (auprc_rna, auprc_prot), (f1_rna, f1_prot)
 
@@ -206,6 +282,7 @@ if __name__ == '__main__':
     parser.add_argument("--alpha", type=float, default=0.1, help="Alpha value for the model.")
 
     # 训练相关参数
+    # parser.add_argument("--local_rank", type=int, default=3, help="Local rank for distributed training.")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size.")
     parser.add_argument("--num_epochs", type=int, default=200, help="Number of epochs.")
     parser.add_argument("--lr", type=float, default=4e-4, help="Learning rate.")
@@ -214,6 +291,7 @@ if __name__ == '__main__':
     parser.add_argument("--data_folder", type=str, default="/data/ymxue/p4_protna/code/logs/bindingsite/", help="Output folder for logs.")
 
     args = parser.parse_args()
+    args.local_rank = int(os.environ.get("LOCAL_RANK", -1))
 
     def set_seed(seed):
         random.seed(seed)  # 设置 Python 的随机种子
@@ -224,46 +302,76 @@ if __name__ == '__main__':
         torch.backends.cudnn.deterministic = True  # 确保 CuDNN 的卷积操作是确定性的
         torch.backends.cudnn.benchmark = False  # 关闭 CuDNN 的自动优化以保证确定性
 
-    # 设置随机种子
-    set_seed(42)
+    # --- 修改 1: 初始化分布式环境 ---
+    if args.local_rank != -1:
+        torch.cuda.set_device(args.local_rank)
+        dist.init_process_group(backend='nccl')
+        device = torch.device("cuda", args.local_rank)
+
+    set_seed(42 + args.local_rank if args.local_rank != -1 else 0)
 
     # 创建输出文件夹
-    os.makedirs(args.output_folder, exist_ok=True)
+    if args.local_rank <= 0:
+        os.makedirs(args.output_folder, exist_ok=True)
     min_train_loss = 100000
     best_epoch = 0
 
-    # 构建 DataLoader
-    train_file = f"{args.data_folder}train_filtered.csv"
-    val_file = f"{args.data_folder}test_filtered.csv"
-    train_dataset = DownstreamDS_token(train_file)  # 预训练模式
-    val_dataset = DownstreamDS_token(val_file)  # 预训练模式
-                                    
-    train_loader, val_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True), DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
-    print(len(train_loader), len(val_loader))
+    # --- 修改 2: DataLoader 使用 DistributedSampler ---
+    train_dataset = DownstreamDS_token(f"{args.data_folder}train.csv")
+    val_dataset = DownstreamDS_token(f"{args.data_folder}test.csv")
 
-    # 初始化模型、优化器和损失函数
-    # model = ModelFineTune(vocab_size=args.vocab_size, hidden_dim=args.hidden_dim).to(args.device)
-    # model.load_pretrained_weights(args.pretrained_weights_path)
-    model = ModelFineTune(alpha=args.alpha, hidden_dim=64, pretrained_weights_path=args.pretrained_weights_path).to(args.device)
-    # model = ModelFineTune(vocab_size=vocab_size, hidden_dim=64).to(device)
+    train_sampler = DistributedSampler(train_dataset) if args.local_rank != -1 else None
+    
+    # 注意：使用 Sampler 时 shuffle 必须为 False
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=(train_sampler is None), 
+        sampler=train_sampler,
+        num_workers=4,
+        pin_memory=True
+    )
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+
+    # --- 修改 3: 模型包装为 DDP ---
+    model = ModelFineTune(alpha=args.alpha, hidden_dim=64, pretrained_weights_path=args.pretrained_weights_path).to(device)
+    
+    if args.local_rank != -1:
+        # find_unused_parameters=True 视你的 Model 内部是否有未使用的分支而定
+        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True, gradient_as_bucket_view=True)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.8)
 
-    # 训练模型
+    # --- 修改 4: 训练循环增加 sampler set_epoch (保证每轮 shuffle 不同) ---
     for epoch in range(args.num_epochs):
-        if epoch % 10 == 0:
-            print(f"Processing Epoch {epoch}")
-        avg_loss, acc, auc, mcc = train(model, train_loader, optimizer, device=args.device)
-        val_avg_loss, val_acc, val_auc, val_mcc, val_auprc, val_f1 = validate(model, val_loader, device=args.device)
-        with open(f"{args.output_folder}log_train.txt", "a") as f:
-            f.write(f"train --- Epoch: {epoch}, loss: {avg_loss}, acc: {acc}, auc: {auc}, mcc: {mcc}\n")
-        with open(f"{args.output_folder}log_val.txt", "a") as f:
-            f.write(f"valid --- Epoch: {epoch}, loss: {val_avg_loss}, acc: {val_acc}, auc: {val_auc}, mcc: {val_mcc}, auprc: {val_auprc}, f1: {val_f1}\n")
-        if avg_loss < min_train_loss:
-            min_train_loss = avg_loss
-            best_epoch = epoch
-            torch.save(model.state_dict(), f"{args.output_folder}best_model.pt")
-    with open(f"{args.output_folder}log_train.txt", "a") as f:
-        f.write(f"Best Epoch: {best_epoch}\n")
-
-
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        
+        # 只在主进程打印和记录
+        is_main_process = (args.local_rank <= 0)
+        
+        # 传入 local_rank 用于控制打印
+        avg_loss, acc, auc, mcc, auprc = train(model, train_loader, optimizer, device=device, local_rank=args.local_rank)
+        
+        if is_main_process:
+            # 验证
+            val_model = model.module if hasattr(model, "module") else model
+            val_avg_loss, val_acc, val_auc, val_mcc, val_auprc, val_f1 = validate(model, val_loader, device=device, local_rank=args.local_rank)
+            
+            # 日志写入 (防止 4 个进程同时写同一个文件导致内容错乱)
+            with open(f"{args.output_folder}log_train.txt", "a") as f:
+                f.write(f"train --- Epoch: {epoch}, loss: {avg_loss}, acc: {acc}, auc: {auc}, mcc: {mcc}, auprc: {auprc}\n")
+            with open(f"{args.output_folder}log_val.txt", "a") as f:
+                f.write(f"valid --- Epoch: {epoch}, loss: {val_avg_loss}, acc: {val_acc}, auc: {val_auc}, mcc: {val_mcc}, auprc: {val_auprc}, f1: {val_f1}\n")
+            
+            # 保存逻辑
+            if avg_loss < min_train_loss:
+                min_train_loss = avg_loss
+                best_epoch = epoch
+                # 重要：DDP 模型必须通过 .module 获取 state_dict
+                model_to_save = model.module if hasattr(model, "module") else model
+                torch.save(model_to_save.state_dict(), f"{args.output_folder}best_model.pt")
+        
+        # 每一轮结束后，所有进程同步一次，防止进度不一致
+        # if args.local_rank != -1:
+        #     dist.barrier(device_ids=[args.local_rank])
