@@ -61,14 +61,7 @@ class ProteinRnaModel(nn.Module):
         
         # Head prediction
         padding_mask = prot_pad.unsqueeze(2) & rna_pad.unsqueeze(1)
-        res = self.head(complex_emb, padding_mask)
-
-        # Post-processing (Cosine Adjustment)
-        rna_mean = torch.mean(rna_embed, dim=1)
-        prot_mean = torch.mean(protein_embed, dim=1)
-        cosine_sim = F.cosine_similarity(rna_mean, prot_mean, dim=-1)
-        res = res * (1 - cosine_sim) ** 0.5
-        
+        res = self.head(complex_emb, padding_mask)        
         return res
 
 @torch.no_grad()
