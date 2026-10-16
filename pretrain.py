@@ -1,3 +1,5 @@
+import os
+
 from utils.dataset import *
 from utils.tokenizer import *
 from model.model import *
@@ -7,19 +9,38 @@ from esm.utils.sampling import _BatchedESMProteinTensor
 from esm.sdk.api import LogitsConfig, ESMProteinTensor
 from multimolecule import RnaFmModel, RnaFmConfig
 class Model(nn.Module):
-    def __init__(self, hidden_dim=64, alpha=0.4):
+    def __init__(
+        self,
+        hidden_dim=64,
+        alpha=0.4,
+        rnafm_path=None,
+        esmc_weights_path=None,
+    ):
         super(Model, self).__init__()
+        rnafm_path = rnafm_path or os.environ.get(
+            "PRORB_RNAFM_PATH", "/data/ymxue/p4_protna/code/fm_model/rnafm"
+        )
+        esmc_weights_path = esmc_weights_path or os.environ.get(
+            "PRORB_ESMC_WEIGHTS_PATH",
+            "/data/ymxue/p4_protna/code/fm_model/esm3/data/weights/esmc_300m_2024_12_v0.pth",
+        )
         # self.embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.rna_config = RnaFmConfig.from_pretrained("/data/ymxue/p4_protna/code/fm_model/rnafm")
+        self.rna_config = RnaFmConfig.from_pretrained(rnafm_path)
         # 强制设回旧版参数（根据你记忆或文档）
         self.rna_config.emb_layer_norm_after = False   # 示例
         self.rna_config.vocab_size = 26 
-        self.rna_model = RnaFmModel.from_pretrained("/data/ymxue/p4_protna/code/fm_model/rnafm", config=self.rna_config, add_pooling_layer=False)
+        self.rna_model = RnaFmModel.from_pretrained(
+            rnafm_path,
+            config=self.rna_config,
+            add_pooling_layer=False,
+        )
 
          # Load ESMC model
          
         self.prot_model = ESMC(d_model=960, n_heads=12, n_layers=30, tokenizer=EsmSequenceTokenizer())
-        self.prot_model.load_state_dict(torch.load("/data/ymxue/p4_protna/code/fm_model/esm3/data/weights/esmc_300m_2024_12_v0.pth"))
+        self.prot_model.load_state_dict(
+            torch.load(esmc_weights_path, map_location="cpu", weights_only=True)
+        )
 
         self.prot_norm = nn.Sequential(
             nn.Linear(64, 64),
