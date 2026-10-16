@@ -21,7 +21,7 @@ class DownstreamHead(nn.Module):
         return self.fc(x).squeeze(-1)
 
 class ModelInference(nn.Module):
-    def __init__(self, alpha=0.1, hidden_dim=64, weights_path=None, device="cuda"):
+    def __init__(self, alpha=0.8, hidden_dim=64, weights_path=None, device="cuda"):
         super(ModelInference, self).__init__()
         self.model = Model(hidden_dim, alpha=alpha)
         self.rna_head = DownstreamHead(hidden_dim)
@@ -67,7 +67,7 @@ class ModelInference(nn.Module):
 
 def run_prediction(data_csv, weights_path, output_path, device="cuda"):
     # 1. 初始化推理模型
-    inf_model = ModelInference(alpha=0.1, weights_path=weights_path, device=device)
+    inf_model = ModelInference(alpha=0.8, weights_path=weights_path, device=device)
 
     # 2. 准备数据集 (推理不需要 Sampler)
     dataset = DownstreamDS_token(data_csv)
